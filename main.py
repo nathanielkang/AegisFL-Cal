@@ -17,7 +17,7 @@ import json
 print("Debug: Starting main.py imports")
 try:
     # Import strategies
-    from strategies.federated_strategies import (
+    from strategies.federated import (
         FedAvgStrategy,
         AegisFLCalStrategy,
         LDPFLStrategy,
@@ -152,7 +152,7 @@ try:
     from utils.evaluation import evaluate_loss, evaluate_accuracy
     from data.client import Client # Ensure Client is imported here
     from data.server import Server
-    from strategies.federated_strategies import (
+    from strategies.federated import (
         FedAvgStrategy,
         AegisFLCalStrategy,
         LDPFLStrategy,
@@ -630,7 +630,7 @@ def run_experiments(args, model_global, clients, test_loader, device, results_di
     
     # Import strategies directly here to ensure they're available
     try:
-        from strategies.federated_strategies import (
+        from strategies.federated import (
             FedAvgStrategy,
             AegisFLCalStrategy,
             LDPFLStrategy,
