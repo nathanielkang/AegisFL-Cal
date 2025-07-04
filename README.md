@@ -1,22 +1,26 @@
 # AegisFL-Cal: A Federated Learning Framework with Privacy-Preserving Calibration
 
-This repository contains the implementation of **AegisFL-Cal**, a federated learning framework that enhances privacy preservation through cryptographic techniques while maintaining model accuracy via calibration mechanisms. This code accompanies our journal paper submission.
+This repository contains the implementation of **AegisFL-Cal**, a federated learning framework that enhances privacy preservation through cryptographic techniques while maintaining model accuracy via calibration mechanisms. This code accompanies our IEEE journal paper submission.
 
 ## Overview
 
 The framework implements multiple federated learning strategies including:
 - **AegisFL-Cal**: Our proposed method with privacy-preserving calibration
 - **FedAvg**: Standard federated averaging baseline
+- **FedProx**: Federated optimization with proximal term
+- **MOON**: Model-contrastive federated learning
 - **LDP-FL**: Local differential privacy federated learning
 - **DP-FedAvg**: Differentially private federated averaging
 - **ACS-FL**: Anonymous communication system for federated learning
 - **Fed-MPS**: Federated learning with multi-party secure aggregation
+- **SMPC-FedAvg**: Secure multi-party computation federated averaging
 
 ## System Requirements
 
 - Python 3.8+
 - PyTorch 1.9.0+
 - CUDA compatible GPU (optional but recommended)
+- TenSEAL library for homomorphic encryption (required for AegisFL-Cal)
 
 ## Installation
 
@@ -31,6 +35,11 @@ cd <repository-name>
 pip install -r requirements.txt
 ```
 
+3. For AegisFL-Cal cryptographic features:
+```bash
+pip install tenseal
+```
+
 ## Dataset Support
 
 The framework supports multiple datasets across different domains:
@@ -39,14 +48,17 @@ The framework supports multiple datasets across different domains:
 - MNIST
 - Fashion-MNIST  
 - CIFAR-10
+- CIFAR-100
 - SVHN
-
 
 ### Text Datasets
 - AG News
-
+- 20 Newsgroups
 
 ### Tabular Datasets
+- Adult
+- Covertype
+- Credit
 - KDD Cup 99
 
 ## Quick Start
@@ -93,6 +105,9 @@ python main.py --dataset mnist --strategy dpfedavg --dpfedavg_epsilon 1.0 --dpfe
 
 # ACS-FL
 python main.py --dataset mnist --strategy acsfl --acsfl_epsilon 1.0 --acsfl_eta_compression_ratio 0.1
+
+# Fed-MPS
+python main.py --dataset mnist --strategy fedmps --fedmps_epsilon 1.0 --fedmps_sigma_gaussian_noise 0.1
 ```
 
 ## Key Parameters
@@ -125,20 +140,37 @@ python main.py --dataset mnist --strategy acsfl --acsfl_epsilon 1.0 --acsfl_eta_
 ├── main.py                           # Main entry point
 ├── requirements.txt                  # Dependencies
 ├── strategies/
-│   └── federated_strategies.py       # All FL strategy implementations
+│   └── federated/                   # Modular FL strategy implementations
+│       ├── __init__.py              # Package initialization
+│       ├── base.py                  # FedAvg base strategy
+│       ├── fedprox.py               # FedProx strategy
+│       ├── moon.py                  # MOON strategy
+│       ├── aegisfl_cal.py           # AegisFL-Cal strategy
+│       ├── ldpfl.py                 # LDP-FL strategy
+│       ├── dpfedavg.py              # DP-FedAvg strategy
+│       ├── acsfl.py                 # ACS-FL strategy
+│       ├── fedmps.py                # Fed-MPS strategy
+│       └── smpc_fedavg.py           # SMPC-FedAvg strategy
 ├── models/
-│   ├── neural_networks.py           # Model architectures
-│   └── data_loader.py               # Model-specific data loading
+│   └── neural_networks.py           # Model architectures
 ├── utils/
 │   ├── data_loader.py               # Dataset loading utilities
-│   ├── evaluation.py               # Model evaluation functions
+│   ├── evaluation.py                # Model evaluation functions
 │   ├── crypto_real.py               # Cryptographic implementations
 │   └── synthetic_generation.py      # Synthetic data generation
 ├── data/
 │   ├── client.py                    # Client implementation
 │   ├── server.py                    # Server implementation
+│   └── [dataset_folders]/           # Dataset storage
 └── README.md                        # This file
 ```
+
+## Recent Updates
+
+- **Modular Architecture**: Refactored strategies into separate modules for better maintainability
+- **Enhanced Strategy Support**: Added FedProx and MOON strategies
+- **Improved Error Handling**: Fixed indentation issues in AegisFL-Cal implementation
+- **Better Code Organization**: Each strategy now has its own file with clear interfaces
 
 ## Experimental Results
 
@@ -147,7 +179,7 @@ The framework has been evaluated on multiple datasets with various privacy and n
 1. **Privacy-Accuracy Trade-off**: AegisFL-Cal achieves better privacy-accuracy trade-offs compared to baseline methods
 2. **Non-IID Robustness**: The calibration mechanism enhances performance under heterogeneous data distributions
 3. **Scalability**: Efficient performance with up to 300+ clients
-4. **Cryptographic Security**: Formal privacy guarantees through range proofs and secure aggregation
+4. **Cryptographic Security**: Formal privacy guarantees through homomorphic encryption and zero-knowledge proofs
 
 
 
@@ -158,6 +190,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Contact
 
 For questions about the implementation or paper, please contact:
-- Nathaniel Kang - natekang@yonsei.ac.kr
+- NATHANIEL KANG - natekang@yonsei.ac.kr
 
 
