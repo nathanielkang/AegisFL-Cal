@@ -1,195 +1,77 @@
-# AegisFL-Cal: A Federated Learning Framework with Privacy-Preserving Calibration
+# AegisFL-Cal
 
-This repository contains the implementation of **AegisFL-Cal**, a federated learning framework that enhances privacy preservation through cryptographic techniques while maintaining model accuracy via calibration mechanisms. This code accompanies our IEEE journal paper submission.
+**A class-conditional sum grows with how many samples a client holds, so a band on the federation mean rejects a large honest client.**
 
-## Overview
+AegisFL-Cal calibrates a federated classifier from encrypted class-conditional feature statistics. Each participant proves that its *normalized mean* lies in the previous round's aggregate band and binds that proof to the CKKS plaintext. A threshold of the round's participants decrypts only the verified sum. The server then samples synthetic features from the decrypted moments and retrains.
 
-The framework implements multiple federated learning strategies including:
-- **AegisFL-Cal**: Our proposed method with privacy-preserving calibration
-- **FedAvg**: Standard federated averaging baseline
-- **FedProx**: Federated optimization with proximal term
-- **MOON**: Model-contrastive federated learning
-- **LDP-FL**: Local differential privacy federated learning
-- **DP-FedAvg**: Differentially private federated averaging
-- **ACS-FL**: Anonymous communication system for federated learning
-- **Fed-MPS**: Federated learning with multi-party secure aggregation
-- **SMPC-FedAvg**: Secure multi-party computation federated averaging
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#layout"><strong>Layout</strong></a>
+</p>
 
-## System Requirements
+## Mean-scale check
 
-- Python 3.8+
-- PyTorch 1.9.0+
-- CUDA compatible GPU (optional but recommended)
-- TenSEAL library for homomorphic encryption (required for AegisFL-Cal)
+A band written on raw sums treats a large honest client as an outlier. The protocol checks the mean, which stays on the feature scale at any sample count, and hashes the ciphertext into the proof challenge so a client cannot prove one value and encrypt another.
 
-## Installation
+<p align="center">
+  <img src="docs/figures/fig_motivation.png" alt="Three-panel motivation: a sum-scale band rejects a large honest client; an unbound proof leaves a gap; the protocol proves the normalized mean against the last aggregate and binds the proof to the ciphertext" width="92%">
+</p>
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd <repository-name>
-```
+## Encrypted statistics, one aggregate
 
-2. Install required dependencies:
+Clients agree on a class-conditional subspace, encrypt projected counts, sums, and outer products, and attach a range proof on the mean. The server sums accepted ciphertexts. Calibration is skipped if fewer than the threshold of the round committee stay online.
+
+<p align="center">
+  <img src="docs/figures/fig_framework.png" alt="AegisFL-Cal framework: subspace agreement, client proof and encryption, server verify-aggregate-sample" width="96%">
+</p>
+
+## Calibration under label skew
+
+On image, text, and tabular tasks with Dirichlet label skew, the protected calibrator improves on federated averaging. Switching the cryptographic layer off recovers only a few more points. Class-wise accuracy is not uniform: some classes rise and others fall when the sampler uses Gaussian marginals.
+
+<p align="center">
+  <img src="docs/figures/fig_results.png" alt="SVHN training accuracy of AegisFL-Cal and federated averaging across communication rounds" width="96%">
+</p>
+
+## Quick start
+
+Python 3.10+ recommended. A GPU is optional.
+
 ```bash
 pip install -r requirements.txt
+python main.py --dataset mnist --num_clients 8 --rounds 2 \
+    --strategy aegisflcal --alpha 0.05 \
+    --aegisflcal_max_s_c 8 --aegisflcal_synthetic_ratio 0.5
 ```
 
-3. For AegisFL-Cal cryptographic features:
+TenSEAL is required for CKKS. MP-SPDZ is optional and used only for the subspace-discovery path.
+
+## Reproduce
+
 ```bash
-pip install tenseal
+python main.py --dataset mnist --num_clients 300 --rounds 100 \
+    --strategy aegisflcal --alpha 0.05 \
+    --aegisflcal_max_s_c 15 --aegisflcal_synthetic_ratio 1.5
 ```
 
-## Dataset Support
+Other strategies: `fedavg`, `dpfedavg`, `ldpfl`, `acsfl`, `fedmps`. Outputs go under `results/` (not tracked).
 
-The framework supports multiple datasets across different domains:
-
-### Image Datasets
-- MNIST
-- Fashion-MNIST  
-- CIFAR-10
-- CIFAR-100
-- SVHN
-
-### Text Datasets
-- AG News
-- 20 Newsgroups
-
-### Tabular Datasets
-- Adult
-- Covertype
-- Credit
-- KDD Cup 99
-
-## Quick Start
-
-### Basic Usage
-
-Run AegisFL-Cal on MNIST with 10 clients:
 ```bash
-python main.py --dataset mnist --num_clients 10 --rounds 20 --strategy aegisflcal
+python main.py --help
 ```
 
-Run FedAvg baseline for comparison:
-```bash
-python main.py --dataset mnist --num_clients 10 --rounds 20 --strategy fedavg
-```
-
-### Advanced Configuration
-
-#### Non-IID Data Distribution
-```bash
-python main.py --dataset cifar10 --num_clients 100 --rounds 50 \
-    --strategy aegisflcal --non_iid --partition_type dirichlet --alpha 0.1
-```
-
-#### AegisFL-Cal Specific Parameters
-```bash
-python main.py --dataset ag_news --num_clients 50 --rounds 30 \
-    --strategy aegisflcal \
-    --aegisflcal_max_s_c 15 \
-    --aegisflcal_synthetic_ratio 1.5 \
-    --aegisflcal_calibration_epochs 3 \
-    --aegisflcal_calibration_lr 0.0001 \
-    --aegisflcal_use_range_proofs \
-    --aegisflcal_l2_bound 10.0
-```
-
-#### Privacy-Preserving Baselines
-```bash
-# LDP-FL
-python main.py --dataset mnist --strategy ldpfl --ldpfl_epsilon 1.0
-
-# DP-FedAvg  
-python main.py --dataset mnist --strategy dpfedavg --dpfedavg_epsilon 1.0 --dpfedavg_clip_norm 1.0
-
-# ACS-FL
-python main.py --dataset mnist --strategy acsfl --acsfl_epsilon 1.0 --acsfl_eta_compression_ratio 0.1
-
-# Fed-MPS
-python main.py --dataset mnist --strategy fedmps --fedmps_epsilon 1.0 --fedmps_sigma_gaussian_noise 0.1
-```
-
-## Key Parameters
-
-### General Parameters
-- `--dataset`: Dataset to use (mnist, cifar10, ag_news, etc.)
-- `--num_clients`: Number of participating clients
-- `--rounds`: Number of federated learning rounds
-- `--local_epochs`: Local training epochs per client
-- `--batch_size`: Training batch size
-- `--lr`: Learning rate
-- `--participation_rate`: Fraction of clients participating per round
-
-### Data Distribution
-- `--non_iid`: Enable non-IID data distribution
-- `--partition_type`: Type of partitioning (iid, dirichlet, pathological)
-- `--alpha`: Dirichlet distribution parameter (smaller = more non-IID)
-
-### AegisFL-Cal Specific
-- `--aegisflcal_max_s_c`: Maximum projected dimension
-- `--aegisflcal_synthetic_ratio`: Synthetic data generation ratio
-- `--aegisflcal_calibration_epochs`: Calibration training epochs
-- `--aegisflcal_calibration_lr`: Calibration learning rate
-- `--aegisflcal_use_range_proofs`: Enable cryptographic range proofs
-- `--aegisflcal_l2_bound`: L2 norm bound for range proofs
-
-## Project Structure
+## Layout
 
 ```
-├── main.py                           # Main entry point
-├── requirements.txt                  # Dependencies
-├── strategies/
-│   └── federated/                   # Modular FL strategy implementations
-│       ├── __init__.py              # Package initialization
-│       ├── base.py                  # FedAvg base strategy
-│       ├── fedprox.py               # FedProx strategy
-│       ├── moon.py                  # MOON strategy
-│       ├── aegisfl_cal.py           # AegisFL-Cal strategy
-│       ├── ldpfl.py                 # LDP-FL strategy
-│       ├── dpfedavg.py              # DP-FedAvg strategy
-│       ├── acsfl.py                 # ACS-FL strategy
-│       ├── fedmps.py                # Fed-MPS strategy
-│       └── smpc_fedavg.py           # SMPC-FedAvg strategy
-├── models/
-│   └── neural_networks.py           # Model architectures
-├── utils/
-│   ├── data_loader.py               # Dataset loading utilities
-│   ├── evaluation.py                # Model evaluation functions
-│   ├── crypto_real.py               # Cryptographic implementations
-│   └── synthetic_generation.py      # Synthetic data generation
-├── data/
-│   ├── client.py                    # Client implementation
-│   ├── server.py                    # Server implementation
-│   └── [dataset_folders]/           # Dataset storage
-└── README.md                        # This file
+main.py                 entry
+strategies/federated/   AegisFL-Cal and baselines
+models/                 networks
+utils/                  crypto, loaders, copula sampler
+data/                   client and server objects
+docs/figures/           motivation, framework, results plates
 ```
 
-## Recent Updates
+## Notes
 
-- **Modular Architecture**: Refactored strategies into separate modules for better maintainability
-- **Enhanced Strategy Support**: Added FedProx and MOON strategies
-- **Improved Error Handling**: Fixed indentation issues in AegisFL-Cal implementation
-- **Better Code Organization**: Each strategy now has its own file with clear interfaces
-
-## Experimental Results
-
-The framework has been evaluated on multiple datasets with various privacy and non-IID settings. Key findings include:
-
-1. **Privacy-Accuracy Trade-off**: AegisFL-Cal achieves better privacy-accuracy trade-offs compared to baseline methods
-2. **Non-IID Robustness**: The calibration mechanism enhances performance under heterogeneous data distributions
-3. **Scalability**: Efficient performance with up to 300+ clients
-4. **Cryptographic Security**: Formal privacy guarantees through homomorphic encryption and zero-knowledge proofs
-
-
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Contact
-
-For questions about the implementation or paper, please contact:
-- NATHANIEL KANG - natekang@yonsei.ac.kr
-
-
+Range proofs in this tree are a working mock of the paper's acceptance predicate: the client mean against the previous-round aggregate band, with the Fiat–Shamir challenge hashed over the ciphertext bytes. The threshold among a round of 30 participants is 16. Datasets download on first use and are not stored in the repository.

@@ -20,7 +20,8 @@ try:
         smpc_secure_sum_tensors, smpc_secure_sum_scalars,
         zkp_verify_statistical_proof,
         he_add,
-        zkp_generate_statistical_proof, zkp_verify_statistical_proof
+        zkp_generate_statistical_proof, zkp_verify_statistical_proof,
+        bounds_from_previous_aggregate, he_threshold_t
     )
 except ImportError as e:
     # NO SIMULATION FALLBACK - FAIL IMMEDIATELY
@@ -48,7 +49,7 @@ class AegisFLCalStrategy(FedAvgStrategy):
                  calibration_patience=3,            
                  calibration_lr_scheduler='none',   
                  d_original_hint=None,              # Dimension of features input to PCA (e.g. raw pixel dim, text embed dim)
-                 pca_variance_explained_threshold=0.95, # New: Variance threshold for adaptive s_c
+                 pca_variance_explained_threshold=0.99, # Paper lock: retain 0.99 of variance
                  data_type='tabular'):              # New: Type of data (tabular, image, text)
         """
         Initialize AegisFLCal strategy.
@@ -106,6 +107,16 @@ class AegisFLCalStrategy(FedAvgStrategy):
         
         self.he_public_key, self.he_private_key = generate_he_keys()
         self.class_global_stats = {}
+        # Previous-round decrypted aggregate bands. Empty on cold start.
+        # Not a median or MAD over individual clients. l2_bound is not primary.
+        self.lagged_bounds_by_class = {}
+        self.he_online_count = None
+        self.l2_bound_is_primary = False
+        self.kappa_steady = float(self.zkp_config.get('kappa', 3.0))
+        self.kappa_cold_start = float(self.zkp_config.get('kappa_cold_start', 5.0))
+        self.paper_roster_n = 300
+        self.paper_participants_n_t = int(self.zkp_config.get('he_round_participants', 30))
+        self.paper_he_threshold_t = int(self.zkp_config.get('he_threshold_t', 16))
         self.synthetic_dataset = None # This will be (list_of_samples_labels_tuples, metadata_dict)
         
         # Add momentum for smoother statistics updates
@@ -239,7 +250,26 @@ class AegisFLCalStrategy(FedAvgStrategy):
         
         num_selected_clients = max(1, int(participation_rate * len(self.clients)))
         selected_clients = self.select_clients(num_selected_clients)
-        # print(f"Selected {len(selected_clients)} clients for round {round_idx+1}")
+        # sk_HE is shared among this round's participants, not the roster of 300.
+        # Paper lock: n_t=30 => t=16. Below t online, skip calibration; FedAvg still runs.
+        n_t = len(selected_clients)
+        t_req = he_threshold_t(n_t)
+        n_online = n_t if self.he_online_count is None else int(self.he_online_count)
+        calibration_quorum = n_online >= t_req
+        self.last_he_threshold = {
+            'n_participants': n_t,
+            't': t_req,
+            'n_online': n_online,
+            'calibration_quorum': calibration_quorum,
+            'paper_n_t': self.paper_participants_n_t,
+            'paper_t': self.paper_he_threshold_t,
+            'cold_start_kappa': self.kappa_cold_start,
+        }
+        if not calibration_quorum:
+            print(
+                f"AegisFL-Cal: {n_online} online < t={t_req} of n_t={n_t}. "
+                "Skip calibration this round; FedAvg still runs."
+            )
         
         if not self.U_subspace_matrices_by_class: # If subspaces not discovered yet (e.g., first round)
             # print("AegisFLCal: No per-class subspaces found, initiating discovery...")
@@ -258,6 +288,8 @@ class AegisFLCalStrategy(FedAvgStrategy):
             client_updates_payload.append({'state_dict': local_model_state_dict, 'client': client})
             if client_loss is not None and not (isinstance(client_loss, float) and np.isnan(client_loss)):
                 round_losses.append(client_loss)
+            if not calibration_quorum:
+                continue
 
             # --- AegisFL-Cal Specific Part: Projection and HE Statistics --- 
             client_local_classes = client.get_local_classes()
@@ -300,7 +332,8 @@ class AegisFLCalStrategy(FedAvgStrategy):
                         projected_data_for_client_all_classes,
                         self.he_public_key,
                         self.zkp_config, 
-                        s_c_config_for_client_stats # Pass the dict of s_c values for relevant classes
+                        s_c_config_for_client_stats,
+                        lagged_bounds_by_class=self.lagged_bounds_by_class,
                     )
                     if client_he_statistics: # If any stats were actually computed and encrypted
                         all_client_he_stats_for_agg.append(client_he_statistics)
@@ -319,6 +352,8 @@ class AegisFLCalStrategy(FedAvgStrategy):
             class_calibration_stats_for_round = self.aggregate_he_statistics(all_client_he_stats_for_agg)
 
         if class_calibration_stats_for_round:
+            # Next round's band is this decrypted aggregate, not an EMA and not a client MAD.
+            self._set_lagged_bounds_from_aggregate(class_calibration_stats_for_round)
             # Apply exponential moving average (EMA) to smooth statistics
             if not self.class_global_stats_ema:
                 # First round: initialize EMA with current stats
@@ -388,16 +423,33 @@ class AegisFLCalStrategy(FedAvgStrategy):
         
         return avg_round_loss
     
+    def _set_lagged_bounds_from_aggregate(self, decrypted_stats: dict) -> None:
+        """Store next round's mean band from this round's decrypted aggregate.
+
+        sigma is the square root of the aggregate covariance diagonal.
+        kappa is 3. Individual client statistics are not decrypted here.
+        """
+        new_bounds = {}
+        for class_label, stats in decrypted_stats.items():
+            mu = stats['mu_proj']
+            cov = stats['O_proj']
+            variance = torch.diagonal(cov).clamp(min=0)
+            sigma = torch.sqrt(variance)
+            new_bounds[class_label] = bounds_from_previous_aggregate(
+                mu, sigma, kappa=self.kappa_steady
+            )
+        self.lagged_bounds_by_class.update(new_bounds)
+
     def aggregate_he_statistics(self, all_client_he_stats_for_agg: List[Dict[Any, Any]]) -> Dict[Any, Any]:
         """
         Aggregates HE statistics from clients, verifying ZKPs first.
-        Uses the new adaptive statistical ZKP verification.
+        Verification uses the previous round's aggregate band, not a
+        median or MAD of the clients in this round.
         """
         # print(f"AegisFLCalStrategy: Aggregating HE statistics from {len(all_client_he_stats_for_agg)} clients.")
         
-        # Phase 1 of adaptive approach: Collect all statistics first (if needed)
-        # In a real implementation, this would be done in a separate round
-        # For now, we'll verify basic validity only
+        # Verify each proof against the previous-round aggregate band, then sum.
+        # Individual plaintexts stay encrypted.
         
         # Initialize dictionaries for aggregated ciphertexts per class
         aggregated_S_ciphertexts = defaultdict(list)
@@ -428,11 +480,19 @@ class AegisFLCalStrategy(FedAvgStrategy):
                     invalid_zkp_count += 1
                     continue
                     
-                # Verify the statistical ZKP proof with adaptive approach
-                # For now, we only check basic validity (no adaptive bounds yet)
+                # Band is the previous round's aggregate. Cold start passes None
+                # (kappa=5, no coordinate test). Do not decrypt this client.
+                lagged = None
+                if self.lagged_bounds_by_class:
+                    lagged = self.lagged_bounds_by_class.get(class_label)
                 is_zkp_valid = zkp_verify_statistical_proof(
                     zkp_proof_obj,
-                    adaptive_bounds=None  # In full implementation, would pass bounds from Phase 1
+                    lagged_bounds=lagged,
+                    ciphertexts=[
+                        stats_and_proof.get('c_S_k_c_proj'),
+                        stats_and_proof.get('c_O_k_c_proj'),
+                        stats_and_proof.get('c_n_k_c'),
+                    ],
                 )
 
                 if is_zkp_valid:

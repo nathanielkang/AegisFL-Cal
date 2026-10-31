@@ -19,6 +19,40 @@ except ImportError:
         "Simulation mode is NOT allowed for cryptographic operations."
     )
 
+# Lock 2026-10-30: ZKP bands use the previous round's aggregate mean/std.
+# kappa=3 in steady state (~99.7% under a Gaussian). Cold start kappa=5.
+# The proved scalar is the client mean S/n. Full Bulletproofs are not in this
+# file; the mock still binds the proof challenge to CKKS ciphertext bytes.
+KAPPA_STEADY = 3.0
+KAPPA_COLD_START = 5.0
+
+
+def plaintext_digest(tensor: torch.Tensor) -> str:
+    """Digest of the plaintext tensor that was passed to CKKS encryption."""
+    flat64 = tensor.detach().flatten().cpu().to(torch.float64).numpy()
+    return hashlib.sha256(flat64.tobytes()).hexdigest()
+
+
+def count_plaintext_tensor(n_k_c: int) -> torch.Tensor:
+    """Canonical plaintext for the encrypted class count."""
+    return torch.tensor([float(n_k_c)], dtype=torch.float32)
+
+
+def he_threshold_t(n_participants: int) -> int:
+    """Decryption threshold among this round's participants.
+
+    t = floor(n_t/2)+1. The paper setting is n_t=30, so t=16.
+    This is not floor(N/2)+1 on a roster of 300.
+    """
+    if n_participants < 1:
+        raise ValueError("n_participants must be positive")
+    return (int(n_participants) // 2) + 1
+
+
+if he_threshold_t(30) != 16:
+    raise RuntimeError("paper threshold lock broken: n_t=30 must give t=16")
+
+
 class PerformanceMonitor:
     """Monitors performance metrics for cryptographic operations."""
     def __init__(self):
@@ -141,6 +175,9 @@ def he_encrypt(plaintext_tensor: torch.Tensor, public_key: HEPublicKey) -> HECip
     # Real encryption using tenseal
     encrypted_vector = ts.ckks_vector(public_key.context.context, flat_data)
     result = HECiphertext(encrypted_vector, public_key, original_shape)
+    # Stamp the plaintext that was encrypted so a proof cannot open a different vector.
+    result.plaintext_digest = plaintext_digest(plaintext_tensor)
+    result.plaintext_numel = int(plaintext_tensor.numel())
     
     size = result.get_size_bytes()
     perf_monitor.end_operation("he_encrypt", size)
@@ -373,7 +410,12 @@ def reset_performance_monitor():
 
 # Bulletproof-style Range Proofs for Input Validation
 class RangeProof:
-    """Simplified Bulletproof-style range proof for L2-norm bounds."""
+    """Optional L2 clip proof. Not the primary statistical test.
+
+    The primary test is the client mean against the previous-round aggregate
+    band (see zkp_generate_statistical_proof). l2_bound does not accept or
+    reject a calibration contribution.
+    """
     def __init__(self, commitment: ZKPCommitment, proof_data: Dict[str, Any]):
         self.commitment = commitment
         self.proof_data = proof_data
@@ -386,14 +428,10 @@ class RangeProof:
 
 def generate_range_proof(features: torch.Tensor, bound: float) -> RangeProof:
     """
-    Generate range proof that ||features||_2 <= bound.
-    
-    Args:
-        features: Feature tensor to prove bounds for
-        bound: L2-norm upper bound
-        
-    Returns:
-        RangeProof object
+    Optional proof that ||features||_2 <= bound.
+
+    Not the primary ZKP test. Calibration accepts or rejects on the client
+    mean S/n against the lagged aggregate band.
     """
     perf_monitor.start_operation("range_proof_generate")
     
@@ -461,134 +499,253 @@ def verify_range_proof(proof: RangeProof, bound: float) -> bool:
         perf_monitor.end_operation("range_proof_verify")
         return False
 
+def _as_1d(value) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().float().flatten()
+    return torch.tensor(value, dtype=torch.float32).flatten()
+
+
+def ciphertext_binding_digest(ciphertexts: List[Any]) -> str:
+    """SHA-256 over serialized CKKS ciphertext bytes, length-prefixed per ciphertext."""
+    hasher = hashlib.sha256()
+    for ct in ciphertexts:
+        if isinstance(ct, (bytes, bytearray)):
+            raw = bytes(ct)
+        else:
+            ser = ct.ciphertext.serialize()
+            raw = ser.encode('utf-8') if isinstance(ser, str) else bytes(ser)
+        hasher.update(len(raw).to_bytes(8, 'big'))
+        hasher.update(raw)
+    return hasher.hexdigest()
+
+
+def fiat_shamir_challenge(statement: str, mean_commitment: str, ciphertext_sha256: str) -> str:
+    """Challenge binds the committed mean to the ciphertext byte digest."""
+    blob = f"{statement}|{mean_commitment}|{ciphertext_sha256}".encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def bounds_from_previous_aggregate(
+    mu_bar: torch.Tensor,
+    sigma_hat: torch.Tensor,
+    kappa: float = KAPPA_STEADY,
+) -> Dict[str, Any]:
+    """Band for client means from the previous round's decrypted aggregate.
+
+    lower/upper = mu_bar ± kappa * sigma_hat on each coordinate.
+    Steady state uses kappa=3. A cold-start anchor, if one is supplied by the
+    caller, uses kappa=5. This function does not look at individual clients.
+    """
+    mu = _as_1d(mu_bar)
+    sigma = _as_1d(sigma_hat).clamp(min=0)
+    if mu.numel() != sigma.numel():
+        raise ValueError("aggregate mean and std must have the same length")
+    kappa_f = float(kappa)
+    return {
+        'source': 'previous_round_aggregate',
+        'kappa': kappa_f,
+        'mu': mu,
+        'sigma': sigma,
+        'lower': mu - kappa_f * sigma,
+        'upper': mu + kappa_f * sigma,
+    }
+
+
+def _variance_numerators_ok(S: torch.Tensor, O: torch.Tensor, n_k_c: int, tol: float = 1e-5) -> bool:
+    """n * O_jj - S_j^2 >= 0 for every coordinate. O_jj stores sum of squares."""
+    if n_k_c <= 0:
+        return False
+    S_flat = _as_1d(S)
+    O_cpu = O.detach().cpu().float() if isinstance(O, torch.Tensor) else torch.tensor(O, dtype=torch.float32)
+    if O_cpu.dim() != 2 or O_cpu.shape[0] != O_cpu.shape[1]:
+        return False
+    if S_flat.numel() != O_cpu.shape[0]:
+        return False
+    if not torch.isfinite(S_flat).all() or not torch.isfinite(O_cpu).all():
+        return False
+    for j in range(S_flat.numel()):
+        var_num = float(n_k_c) * float(O_cpu[j, j]) - float(S_flat[j]) ** 2
+        if var_num != var_num or var_num < -tol:
+            return False
+    return True
+
+
+def _mean_in_lagged_band(mean: torch.Tensor, lagged_bounds: Dict[str, Any], tol: float = 1e-4) -> bool:
+    lower = _as_1d(lagged_bounds['lower'])
+    upper = _as_1d(lagged_bounds['upper'])
+    m = _as_1d(mean)
+    if m.numel() != lower.numel() or m.numel() != upper.numel():
+        return False
+    return bool(torch.all(m >= lower - tol) and torch.all(m <= upper + tol))
+
+
 def zkp_generate_statistical_proof(
-    S_k_c_proj: torch.Tensor, 
-    O_k_c_proj: torch.Tensor, 
+    S_k_c_proj: torch.Tensor,
+    O_k_c_proj: torch.Tensor,
     n_k_c: int,
     U_c: torch.Tensor,
-    # No more manual parameters - we'll use adaptive bounds from aggregated stats
+    lagged_bounds: Dict[str, Any] = None,
+    ciphertexts: List[Any] = None,
     ) -> ZKPProof:
     """
-    Generate ZKP for statistical properties using adaptive outlier detection.
-    This is Phase 2 of Option 1: clients prove their stats are not outliers.
-    
-    In the real implementation, clients would receive bounds from Phase 1 
-    (median ± k*MAD for each statistic dimension) and prove compliance.
-    For now, we simulate by checking basic validity only.
+    Prove the client mean S/n, not the raw sum.
+
+    Required statements: n>0, n*O_jj - S_j^2 >= 0, and, when lagged_bounds is
+    set, S_j/n inside the previous-round aggregate band. Cold start (no
+    previous aggregate) records kappa=5 and skips the coordinate test.
+
+    The Fiat-Shamir challenge hashes the CKKS ciphertext bytes. Full
+    Bulletproofs are not implemented; this is a working mock with that API.
+    l2_bound is not consulted.
     """
     perf_monitor.start_operation("zkp_generate_statistical")
 
-    # Commit to the inputs
+    n_k_c = int(n_k_c)
+    n_plain = count_plaintext_tensor(n_k_c)
+    n_positive = n_k_c > 0
+    values_finite = bool(
+        torch.isfinite(S_k_c_proj).all().item() and torch.isfinite(O_k_c_proj).all().item()
+    )
+    if n_positive:
+        means = _as_1d(S_k_c_proj) / float(n_k_c)
+    else:
+        means = _as_1d(S_k_c_proj) * 0.0
+
+    var_ok = n_positive and values_finite and _variance_numerators_ok(S_k_c_proj, O_k_c_proj, n_k_c)
+    cold_start = lagged_bounds is None
+    in_band = True
+    kappa = KAPPA_COLD_START if cold_start else float(lagged_bounds.get('kappa', KAPPA_STEADY))
+    if not cold_start:
+        in_band = _mean_in_lagged_band(means, lagged_bounds)
+
+    bound_to_ciphertexts = False
+    ciphertext_sha = None
+    if ciphertexts is not None and len(ciphertexts) == 3:
+        s_match = getattr(ciphertexts[0], 'plaintext_digest', None) == plaintext_digest(S_k_c_proj)
+        o_match = getattr(ciphertexts[1], 'plaintext_digest', None) == plaintext_digest(O_k_c_proj)
+        n_match = getattr(ciphertexts[2], 'plaintext_digest', None) == plaintext_digest(n_plain)
+        if s_match and o_match and n_match:
+            ciphertext_sha = ciphertext_binding_digest(ciphertexts)
+            bound_to_ciphertexts = True
+
+    valid_stats = bool(n_positive and values_finite and var_ok and in_band and bound_to_ciphertexts)
+
     commitments = {
+        'client_mean': ZKPCommitment(means),
         'S_k_c_proj': ZKPCommitment(S_k_c_proj),
         'O_k_c_proj': ZKPCommitment(O_k_c_proj),
-        'n_k_c': ZKPCommitment(torch.tensor(n_k_c)),
-        'U_c': ZKPCommitment(U_c)
+        'n_plain': ZKPCommitment(n_plain),
+        'U_c': ZKPCommitment(U_c),
     }
+    statement = "Client mean S/n lies in the previous-round aggregate band and matches the CKKS plaintext"
+    mean_commitment_hex = commitments['client_mean'].commitment
+    challenge = fiat_shamir_challenge(statement, mean_commitment_hex, ciphertext_sha or "")
 
-    statistical_checks_results = {}
-    valid_stats = True
-
-    # Basic validity checks (always required)
-    # 1. Non-zero sample size
-    check_n_positive = n_k_c > 0
-    statistical_checks_results['n_positive'] = check_n_positive
-    if not check_n_positive: 
-        valid_stats = False
-    
-    if n_k_c > 0:
-        # 2. Finite values check (no NaN or Inf)
-        s_finite = torch.isfinite(S_k_c_proj).all().item()
-        o_finite = torch.isfinite(O_k_c_proj).all().item()
-        statistical_checks_results['values_finite'] = s_finite and o_finite
-        if not (s_finite and o_finite):
-            valid_stats = False
-        
-        # 3. Covariance matrix validity (diagonal elements should be non-negative)
-        # This ensures variances are non-negative
-        if n_k_c > 1:
-            # Check diagonal elements of covariance
-            for j in range(S_k_c_proj.shape[0]):
-                sum_x_j = S_k_c_proj[j]
-                sum_x_j_sq = O_k_c_proj[j, j]
-                # Variance numerator: n * sum(x^2) - sum(x)^2
-                var_num = n_k_c * sum_x_j_sq - sum_x_j**2
-                if var_num.item() < -1e-9:  # Small tolerance for numerical errors
-                    statistical_checks_results['non_negative_variances'] = False
-                    valid_stats = False
-                    break
-            else:
-                statistical_checks_results['non_negative_variances'] = True
-        else:
-            # For n=1, variance is undefined but we can proceed
-            statistical_checks_results['non_negative_variances'] = True
-
-    # Statement for the proof
-    statement = "Proof of basic statistical validity for adaptive outlier detection"
+    statistical_checks_results = {
+        'n_positive': bool(n_positive),
+        'values_finite': bool(values_finite),
+        'variance_numerator_nonnegative': bool(var_ok),
+        'ciphertext_bound': bool(bound_to_ciphertexts),
+        'mean_in_lagged_band': bool(in_band) if not cold_start else True,
+    }
     computation_proof_details = {
-        'proof_type': 'adaptive_outlier_detection',
-        'phase': 'client_computation',
-        'checks_performed': list(statistical_checks_results.keys()),
-        'final_validity': valid_stats
+        'proof_type': 'lagged_aggregate_mean_range',
+        'proved_quantity': 'client_mean_S_over_n',
+        'primary_test': 'previous_round_aggregate_mean_std',
+        'l2_is_primary': False,
+        'full_bulletproofs': False,
+        'cold_start': bool(cold_start),
+        'kappa': kappa,
+        'coordinate_test': (not cold_start),
+        'ciphertext_sha256': ciphertext_sha,
+        'fiat_shamir_challenge': challenge,
+        'final_validity': valid_stats,
     }
-    
+
     proof = ZKPProof(statement, commitments, computation_proof_details, statistical_checks_results)
-    
-    size = proof.get_size_bytes()
-    perf_monitor.end_operation("zkp_generate_statistical", size)
+    perf_monitor.end_operation("zkp_generate_statistical", proof.get_size_bytes())
     return proof
 
 def zkp_verify_statistical_proof(
     proof: ZKPProof,
-    adaptive_bounds: Dict[str, Any] = None
+    lagged_bounds: Dict[str, Any] = None,
+    ciphertexts: List[Any] = None,
+    adaptive_bounds: Dict[str, Any] = None,
     ) -> bool:
     """
-    Verify ZKP for statistical properties with adaptive outlier detection.
-    
-    Args:
-        proof: ZKP proof from client
-        adaptive_bounds: Optional dict containing adaptive bounds computed from Phase 1
-                        Format: {
-                            'median_S': tensor of median values for S per dimension,
-                            'mad_S': tensor of MAD values for S per dimension,
-                            'median_O_diag': tensor of median values for O diagonal,
-                            'mad_O_diag': tensor of MAD values for O diagonal,
-                            'median_n': scalar median of sample counts,
-                            'mad_n': scalar MAD of sample counts,
-                            'k': number of MADs for outlier threshold (default 3)
-                        }
-    
-    Returns:
-        True if proof is valid and (if bounds provided) stats are within bounds
+    Verify a client-mean proof against lagged aggregate bounds.
+
+    lagged_bounds is the server's previous-round aggregate band (or None on
+    cold start). adaptive_bounds is accepted only so older call sites still
+    load; a median/MAD dict is ignored and cannot accept the proof.
+    The server recomputes the band check from the committed mean. It does not
+    decrypt individual clients and does not compute a median or MAD.
     """
     perf_monitor.start_operation("zkp_verify_statistical")
+    del adaptive_bounds  # median/MAD over clients is not a verification input
 
     try:
-        # 1. Verify proof integrity
-        expected_hash = proof._compute_proof_hash()
-        if expected_hash != proof.proof_hash:
-            print("ZKP statistical proof hash mismatch.")
+        if proof.computation_proof.get('proof_type') != 'lagged_aggregate_mean_range':
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if proof.computation_proof.get('l2_is_primary'):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if proof._compute_proof_hash() != proof.proof_hash:
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if not ciphertexts or len(ciphertexts) != 3:
             perf_monitor.end_operation("zkp_verify_statistical")
             return False
 
-        # 2. Check basic validity from proof
-        final_validity_in_proof = proof.computation_proof.get('final_validity', False)
-        if not final_validity_in_proof:
+        digest = ciphertext_binding_digest(ciphertexts)
+        if digest != proof.computation_proof.get('ciphertext_sha256'):
             perf_monitor.end_operation("zkp_verify_statistical")
             return False
 
-        # 3. If adaptive bounds are provided (from Phase 1), verify against them
-        # In a real implementation, the server would have computed these bounds
-        # from the first round of statistics collection
-        if adaptive_bounds is not None:
-            # This would involve checking that the client's committed values
-            # fall within median ± k*MAD for each dimension
-            # For simulation, we just check the proof type matches
-            if proof.computation_proof.get('proof_type') != 'adaptive_outlier_detection':
-                print("ZKP proof type mismatch for adaptive outlier detection.")
+        S = proof.commitments['S_k_c_proj'].data
+        O = proof.commitments['O_k_c_proj'].data
+        n_plain = proof.commitments['n_plain'].data
+        means = proof.commitments['client_mean'].data
+        if plaintext_digest(S) != getattr(ciphertexts[0], 'plaintext_digest', None):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if plaintext_digest(O) != getattr(ciphertexts[1], 'plaintext_digest', None):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if plaintext_digest(n_plain) != getattr(ciphertexts[2], 'plaintext_digest', None):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+
+        n_val = float(_as_1d(n_plain)[0])
+        n_k_c = int(round(n_val))
+        if n_k_c <= 0 or abs(n_val - n_k_c) > 1e-6:
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        if not _variance_numerators_ok(S, O, n_k_c):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+        expected_mean = _as_1d(S) / float(n_k_c)
+        if not torch.allclose(_as_1d(means), expected_mean, rtol=0.0, atol=1e-5):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+
+        statement = proof.statement
+        challenge = fiat_shamir_challenge(
+            statement, proof.commitments['client_mean'].commitment, digest
+        )
+        if challenge != proof.computation_proof.get('fiat_shamir_challenge'):
+            perf_monitor.end_operation("zkp_verify_statistical")
+            return False
+
+        # Cold start: no previous aggregate, so no coordinate reject (kappa=5 is the
+        # multiplier once an anchor exists). Steady state: server band, kappa from
+        # that band (paper value 3).
+        if lagged_bounds is not None:
+            if not _mean_in_lagged_band(means, lagged_bounds):
                 perf_monitor.end_operation("zkp_verify_statistical")
                 return False
-            
+
         perf_monitor.end_operation("zkp_verify_statistical")
         return True
 
@@ -597,60 +754,9 @@ def zkp_verify_statistical_proof(
         perf_monitor.end_operation("zkp_verify_statistical")
         return False
 
-def compute_adaptive_bounds(all_client_stats: List[Dict[str, Any]], k: float = 3.0) -> Dict[str, Any]:
-    """
-    Compute adaptive bounds using median and MAD for outlier detection.
-    This is Phase 1 of Option 1: collect stats and compute robust bounds.
-    
-    Args:
-        all_client_stats: List of client statistics dictionaries
-        k: Number of MADs for outlier threshold (default 3, following 3-sigma rule)
-    
-    Returns:
-        Dictionary with median and MAD values for each statistic type
-    """
-    if not all_client_stats:
-        return None
-    
-    # Collect all values for each statistic type
-    all_S_values = []
-    all_O_diag_values = []
-    all_n_values = []
-    
-    for stats in all_client_stats:
-        if 'S_k_c_proj' in stats:
-            all_S_values.append(stats['S_k_c_proj'])
-        if 'O_k_c_proj' in stats:
-            # Extract diagonal elements
-            O_diag = torch.diag(stats['O_k_c_proj'])
-            all_O_diag_values.append(O_diag)
-        if 'n_k_c' in stats:
-            all_n_values.append(float(stats['n_k_c']))
-    
-    bounds = {'k': k}
-    
-    # Compute bounds for S (per dimension)
-    if all_S_values:
-        S_tensor = torch.stack(all_S_values)
-        median_S = torch.median(S_tensor, dim=0)[0]
-        mad_S = torch.median(torch.abs(S_tensor - median_S.unsqueeze(0)), dim=0)[0]
-        bounds['median_S'] = median_S
-        bounds['mad_S'] = mad_S
-    
-    # Compute bounds for O diagonal (per dimension)
-    if all_O_diag_values:
-        O_diag_tensor = torch.stack(all_O_diag_values)
-        median_O_diag = torch.median(O_diag_tensor, dim=0)[0]
-        mad_O_diag = torch.median(torch.abs(O_diag_tensor - median_O_diag.unsqueeze(0)), dim=0)[0]
-        bounds['median_O_diag'] = median_O_diag
-        bounds['mad_O_diag'] = mad_O_diag
-    
-    # Compute bounds for n (scalar)
-    if all_n_values:
-        n_tensor = torch.tensor(all_n_values)
-        median_n = torch.median(n_tensor).item()
-        mad_n = torch.median(torch.abs(n_tensor - median_n)).item()
-        bounds['median_n'] = median_n
-        bounds['mad_n'] = mad_n
-    
-    return bounds 
+def compute_adaptive_bounds(*args, **kwargs) -> Dict[str, Any]:
+    """Removed. Median/MAD over individual clients is not the bound."""
+    raise RuntimeError(
+        "median/MAD over clients is dropped. "
+        "Use bounds_from_previous_aggregate(mu_bar, sigma_hat, kappa=3)."
+    ) 

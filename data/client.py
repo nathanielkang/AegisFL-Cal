@@ -17,7 +17,8 @@ try:
     from utils.crypto_real import (
         HEPublicKey, HEPrivateKey, HECiphertext,
         he_encrypt, he_decrypt, he_sum_ciphertexts,
-        zkp_generate_statistical_proof, zkp_verify_statistical_proof, ZKPProof
+        zkp_generate_statistical_proof, zkp_verify_statistical_proof, ZKPProof,
+        count_plaintext_tensor
     )
 except ImportError as e:
     # NO SIMULATION FALLBACK - FAIL IMMEDIATELY
@@ -1471,10 +1472,14 @@ class Client:
             if model_for_feature_extraction is not None: model_for_feature_extraction.train(original_model_training_state_proj) 
             return {}
 
-    def compute_projected_stats_encrypt_prove_for_aegisflcal(self, projected_data_dict_all_classes, he_public_key: HEPublicKey, zkp_config, s_c_values_by_class_dict: dict):
+    def compute_projected_stats_encrypt_prove_for_aegisflcal(self, projected_data_dict_all_classes, he_public_key: HEPublicKey, zkp_config, s_c_values_by_class_dict: dict, lagged_bounds_by_class=None):
         """
-        Computes statistics from projected data, encrypts them, and generates ZKPs.
-        Uses the new adaptive statistical ZKP without manual parameter tuning.
+        Encrypt class sums, then prove the client mean S/n.
+
+        lagged_bounds_by_class maps a class to the previous round's aggregate
+        band (mean ± kappa * std). None means cold start (kappa=5, no
+        coordinate test). The proof is bound to the CKKS ciphertext bytes.
+        l2_bound in zkp_config is not the accept/reject test.
         """
         client_stats_package = {}
         
@@ -1498,19 +1503,23 @@ class Client:
                 feature_vec = projected_features[i].unsqueeze(1) # (s_c, 1)
                 O_k_c_proj += torch.matmul(feature_vec, feature_vec.T) # (s_c, 1) @ (1, s_c) -> (s_c, s_c)
 
-            # Generate ZKP for statistical properties using adaptive approach
-            # No manual parameters needed - the proof will check basic validity
+            # Encrypt the sums that the server aggregates, then prove S/n
+            # against the lagged aggregate band and bind that proof to these bytes.
+            n_plain = count_plaintext_tensor(n_k_c)
+            c_S_k_c_proj = he_encrypt(S_k_c_proj, he_public_key)
+            c_O_k_c_proj = he_encrypt(O_k_c_proj, he_public_key)
+            c_n_k_c = he_encrypt(n_plain, he_public_key)
+            class_bounds = None
+            if lagged_bounds_by_class:
+                class_bounds = lagged_bounds_by_class.get(class_label)
             statistical_zkp = zkp_generate_statistical_proof(
                 S_k_c_proj,
                 O_k_c_proj,
                 n_k_c,
-                U_c_matrix_used  # Pass U_c for commitment inside ZKP
+                U_c_matrix_used,
+                lagged_bounds=class_bounds,
+                ciphertexts=[c_S_k_c_proj, c_O_k_c_proj, c_n_k_c],
             )
-
-            # Encrypt statistics
-            c_S_k_c_proj = he_encrypt(S_k_c_proj, he_public_key)
-            c_O_k_c_proj = he_encrypt(O_k_c_proj, he_public_key)
-            c_n_k_c = he_encrypt(torch.tensor(float(n_k_c)), he_public_key) # Ensure n_k_c is float tensor for HE
 
             client_stats_package[class_label] = {
                 'c_S_k_c_proj': c_S_k_c_proj,

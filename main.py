@@ -196,7 +196,7 @@ def get_args():
     full_parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     full_parser.add_argument('--optimizer', type=str, default='adam', choices=['sgd', 'adam'], help='Optimizer to use')
     full_parser.add_argument('--participation_rate', type=float, default=1.0, help='Fraction of clients participating in each round')
-    full_parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    full_parser.add_argument('--seed', type=int, default=42, help='Random seed for one run. Table IV intervals use 3 seeds; this flag does not launch that sweep.')
     full_parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use, -1 for CPU') # Matches early parser
     full_parser.add_argument('--results_dir', type=str, default='./results', help='Directory to save results')
     full_parser.add_argument('--save_model', action='store_true', help='Save the trained global model')
@@ -230,10 +230,13 @@ def get_args():
     full_parser.add_argument('--aegisflcal_calibration_wd', type=float, default=0.0, help='Weight decay for AegisFLCal calibration')
     full_parser.add_argument('--aegisflcal_calibration_patience', type=int, default=3, help='Early stopping patience for AegisFLCal calibration')
     full_parser.add_argument('--aegisflcal_calibration_lr_scheduler', type=str, default='none', choices=['none', 'plateau', 'cosine'], help='LR scheduler for AegisFLCal calibration')
-    full_parser.add_argument('--aegisflcal_pca_variance_threshold', type=float, default=0.95, help='Variance threshold for adaptive s_c in AegisFLCal PCA')
-    # Range proof arguments for AegisFL-Cal
-    full_parser.add_argument('--aegisflcal_use_range_proofs', action='store_true', help='Enable range proofs for AegisFLCal')
-    full_parser.add_argument('--aegisflcal_l2_bound', type=float, default=10.0, help='L2 norm bound for AegisFLCal range proofs')
+    full_parser.add_argument('--aegisflcal_pca_variance_threshold', type=float, default=0.99, help='PCA variance retained for adaptive s_c (paper lock 0.99)')
+    # l2_bound is not the primary ZKP test. Primary test: client mean vs previous-round aggregate band.
+    # HE threshold is among the round's participants: n_t=30 => t=16. Not t>N/2 of 300.
+    full_parser.add_argument('--aegisflcal_use_range_proofs', action='store_true', help='Optional secondary range proof. Not the primary statistical test.')
+    full_parser.add_argument('--aegisflcal_l2_bound', type=float, default=10.0, help='Optional L2 clip. Not the primary test; primary test is S/n against the lagged aggregate band (kappa=3, cold start kappa=5).')
+    full_parser.add_argument('--aegisflcal_he_participants', type=int, default=30, help='Paper round size n_t. Threshold t=floor(n_t/2)+1 is 16 when n_t=30.')
+    full_parser.add_argument('--aegisflcal_he_threshold', type=int, default=16, help='Documented paper threshold t=16 of 30 participants. The round still computes t from the clients actually selected.')
     
     # LDP-FL specific arguments
     full_parser.add_argument('--ldpfl_epsilon', type=float, default=1.0, help='Epsilon for LDP-FL')
@@ -702,10 +705,17 @@ def run_experiments(args, model_global, clients, test_loader, device, results_di
             'data_type': data_type  # Pass the detected data type
         }
         zkp_config_for_strategy = {
-            # Adaptive ZKP approach - no manual parameters needed
-            'use_adaptive_bounds': True,  # Flag to indicate we're using adaptive approach
-            'use_range_proofs': args.aegisflcal_use_range_proofs,  # Enable range proofs if specified
-            'l2_bound': args.aegisflcal_l2_bound  # L2 norm bound for range proofs
+            # Primary test: previous-round aggregate mean/std, kappa=3 (cold start kappa=5).
+            # l2_bound is not that test. Participants n_t=30, threshold t=16.
+            'use_adaptive_bounds': True,
+            'primary_test': 'lagged_aggregate_mean',
+            'l2_bound_is_primary': False,
+            'kappa': 3.0,
+            'kappa_cold_start': 5.0,
+            'he_round_participants': args.aegisflcal_he_participants,
+            'he_threshold_t': args.aegisflcal_he_threshold,
+            'use_range_proofs': args.aegisflcal_use_range_proofs,
+            'l2_bound': args.aegisflcal_l2_bound,
         }
 
         strategy = AegisFLCalStrategy(

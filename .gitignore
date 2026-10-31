@@ -1,0 +1,16 @@
+﻿__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+results/
+results__*/
+data/MNIST/
+data/FashionMNIST/
+data/cifar-10-batches-py/
+data/svhn/
+data/ag_news/
+data/kddcup99/
+*.csv
+.DS_Store
+paper/
